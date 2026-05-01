@@ -189,9 +189,9 @@ const userSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-userSchema.pre('save', function (next) {
+userSchema.pre('save', function () {
     if (!Array.isArray(this.addresses) || this.addresses.length === 0) {
-        return next();
+        return;
     }
 
     const defaultAddresses = this.addresses.filter((address) => address.isDefault);
@@ -209,8 +209,6 @@ userSchema.pre('save', function (next) {
             address.isDefault = false;
         });
     }
-
-    next();
 });
 
 module.exports = mongoose.model('User', userSchema);

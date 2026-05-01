@@ -5,6 +5,7 @@ const {
 	register,
 	login,
 	getMe,
+	getCustomerOverview,
 	updateMe,
 	changePassword,
 	forgotPassword,
@@ -22,6 +23,7 @@ router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);
 
 router.get('/me', protect, getMe);
+router.get('/customer-overview', protect, getCustomerOverview);
 router.put('/me', protect, updateMe);
 router.put('/change-password', protect, changePassword);
 

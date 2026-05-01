@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const User = require('../models/User');
+const Order = require('../models/Order');
+const SupportTicket = require('../models/SupportTicket');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
@@ -21,6 +23,10 @@ const generateToken = (id) => {
         expiresIn: '7d',
     });
 };
+
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
+
+const isValidEmail = (value) => /^\S+@\S+\.\S+$/.test(value);
 
 const sanitizeUser = (user) => ({
     id: user._id,
@@ -66,7 +72,22 @@ const normalizeAddressPayload = (payload = {}) => {
 // Register User
 exports.register = async (req, res) => {
     try {
-        const { name, email, password, phone } = req.body;
+        const name = String(req.body.name || '').trim();
+        const email = normalizeEmail(req.body.email);
+        const password = String(req.body.password || '');
+        const phone = String(req.body.phone || '').trim();
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ message: 'name, email, and password are required' });
+        }
+
+        if (!isValidEmail(email)) {
+            return res.status(400).json({ message: 'Please provide a valid email address' });
+        }
+
+        if (password.length < 6) {
+            return res.status(400).json({ message: 'Password must be at least 6 characters' });
+        }
 
         // Check if user exists
         const existingUser = await User.findOne({ email });
@@ -81,7 +102,7 @@ exports.register = async (req, res) => {
         const user = await User.create({
             name,
             email,
-            phone: phone || '',
+            phone,
             password: hashedPassword,
         });
 
@@ -98,7 +119,12 @@ exports.register = async (req, res) => {
 // Login User
 exports.login = async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const email = normalizeEmail(req.body.email);
+        const password = String(req.body.password || '');
+
+        if (!email || !password) {
+            return res.status(400).json({ message: 'Email and password are required' });
+        }
 
         const user = await User.findOne({ email });
         if (!user) {
@@ -128,6 +154,64 @@ exports.getMe = async (req, res) => {
         }
 
         res.json(sanitizeUser(user));
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+exports.getCustomerOverview = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).select('-password').lean();
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const cartItems = Array.isArray(user.cart) ? user.cart : [];
+        const addresses = Array.isArray(user.addresses) ? user.addresses : [];
+        const wishlistCount = Array.isArray(user.wishlist) ? user.wishlist.length : 0;
+        const defaultAddress = addresses.find((address) => address.isDefault) || addresses[0] || null;
+        const cartTotal = cartItems.reduce((sum, item) => {
+            const regularPrice = Number(item?.price || 0);
+            const salePrice = item?.salePrice == null ? null : Number(item.salePrice);
+            const unitPrice = salePrice != null && salePrice < regularPrice ? salePrice : regularPrice;
+            return sum + (unitPrice * Number(item?.quantity || 0));
+        }, 0);
+
+        const [recentOrders, recentSupportTickets, orderCount, deliveredOrderCount, openTicketCount] = await Promise.all([
+            Order.find({ user: req.user._id })
+                .sort({ createdAt: -1 })
+                .limit(3)
+                .select('orderNumber status paymentStatus total createdAt items')
+                .lean(),
+            SupportTicket.find({ user: req.user._id })
+                .sort({ lastMessageAt: -1, createdAt: -1 })
+                .limit(3)
+                .select('ticketNumber subject status priority lastMessageAt')
+                .lean(),
+            Order.countDocuments({ user: req.user._id }),
+            Order.countDocuments({ user: req.user._id, status: 'delivered' }),
+            SupportTicket.countDocuments({
+                user: req.user._id,
+                status: { $nin: ['resolved', 'closed'] },
+            }),
+        ]);
+
+        res.json({
+            user: sanitizeUser(user),
+            addresses,
+            defaultAddress,
+            summary: {
+                orderCount,
+                deliveredOrderCount,
+                openTicketCount,
+                wishlistCount,
+                cartLineCount: cartItems.length,
+                cartItemCount: cartItems.reduce((sum, item) => sum + Number(item?.quantity || 0), 0),
+                cartTotal: Number(cartTotal.toFixed(2)),
+            },
+            recentOrders,
+            recentSupportTickets,
+        });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
