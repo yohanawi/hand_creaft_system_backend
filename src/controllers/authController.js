@@ -28,12 +28,48 @@ const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
 
 const isValidEmail = (value) => /^\S+@\S+\.\S+$/.test(value);
 
+const isValidPhone = (value) => /^[+]?[0-9()\-\s]{7,20}$/.test(String(value || '').trim());
+
+const isStrongPassword = (value) => /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(String(value || ''));
+
+const passwordRequirementMessage = 'Password must be at least 8 characters and include uppercase, lowercase, and a number';
+
+const maskAccountNumber = (value) => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) {
+        return '';
+    }
+
+    return trimmed.length <= 4 ? trimmed : `****${trimmed.slice(-4)}`;
+};
+
 const sanitizeUser = (user) => ({
     id: user._id,
     name: user.name,
     email: user.email,
     phone: user.phone || '',
     role: user.role,
+    sellerStatus: user.sellerStatus || (user.role === 'seller' ? 'approved' : 'inactive'),
+    sellerProfile: {
+        shopName: user.sellerProfile?.shopName || '',
+        shopSlug: user.sellerProfile?.shopSlug || '',
+        bio: user.sellerProfile?.bio || '',
+        logo: user.sellerProfile?.logo || '',
+        banner: user.sellerProfile?.banner || '',
+        city: user.sellerProfile?.city || '',
+        state: user.sellerProfile?.state || '',
+        country: user.sellerProfile?.country || 'US',
+        contactEmail: user.sellerProfile?.contactEmail || '',
+        contactPhone: user.sellerProfile?.contactPhone || '',
+        materials: Array.isArray(user.sellerProfile?.materials) ? user.sellerProfile.materials : [],
+        processingTimeLabel: user.sellerProfile?.processingTimeLabel || '',
+        shippingPolicy: user.sellerProfile?.shippingPolicy || '',
+        returnPolicy: user.sellerProfile?.returnPolicy || '',
+        bankName: user.sellerProfile?.bankName || '',
+        accountHolderName: user.sellerProfile?.accountHolderName || '',
+        accountNumberMasked: maskAccountNumber(user.sellerProfile?.accountNumber),
+        payoutEmail: user.sellerProfile?.payoutEmail || '',
+    },
     emailVerified: !!user.emailVerified,
     addresses: Array.isArray(user.addresses) ? user.addresses : [],
 });
@@ -49,8 +85,12 @@ const normalizeAddressPayload = (payload = {}) => {
     const country = String(payload.country || 'US').trim();
     const label = String(payload.label || 'Address').trim();
 
-    if (!fullName || !phone || !addressLine1 || !city || !zipCode) {
-        return { error: 'fullName, phone, addressLine1, city, and zipCode are required' };
+    if (!fullName || !phone || !addressLine1 || !city || !state || !zipCode || !country) {
+        return { error: 'fullName, phone, addressLine1, city, state, zipCode, and country are required' };
+    }
+
+    if (!isValidPhone(phone)) {
+        return { error: 'Invalid phone format' };
     }
 
     return {
@@ -85,8 +125,12 @@ exports.register = async (req, res) => {
             return res.status(400).json({ message: 'Please provide a valid email address' });
         }
 
-        if (password.length < 6) {
-            return res.status(400).json({ message: 'Password must be at least 6 characters' });
+        if (!isStrongPassword(password)) {
+            return res.status(400).json({ message: passwordRequirementMessage });
+        }
+
+        if (phone && !isValidPhone(phone)) {
+            return res.status(400).json({ message: 'Invalid phone format' });
         }
 
         // Check if user exists
@@ -104,6 +148,10 @@ exports.register = async (req, res) => {
             email,
             phone,
             password: hashedPassword,
+            sellerProfile: {
+                contactEmail: email,
+                contactPhone: phone,
+            },
         });
 
         res.status(201).json({
@@ -226,20 +274,41 @@ exports.updateMe = async (req, res) => {
 
         const { name, email, phone } = req.body;
 
-        if (typeof name === 'string' && name.trim()) {
+        if (typeof name === 'string') {
+            if (!name.trim()) {
+                return res.status(400).json({ message: 'Name cannot be empty' });
+            }
+
             user.name = name.trim();
         }
 
-        if (typeof email === 'string' && email.trim() && email.trim().toLowerCase() !== user.email) {
-            const existingUser = await User.findOne({ email: email.trim().toLowerCase() });
+        if (typeof email === 'string') {
+            const normalizedEmail = email.trim().toLowerCase();
+
+            if (!normalizedEmail) {
+                return res.status(400).json({ message: 'Email cannot be empty' });
+            }
+
+            if (!isValidEmail(normalizedEmail)) {
+                return res.status(400).json({ message: 'Invalid email format' });
+            }
+
+            const existingUser = await User.findOne({ email: normalizedEmail });
             if (existingUser && String(existingUser._id) !== String(user._id)) {
                 return res.status(400).json({ message: 'Email already exists' });
             }
-            user.email = email.trim().toLowerCase();
+
+            user.email = normalizedEmail;
         }
 
         if (typeof phone === 'string') {
-            user.phone = phone.trim();
+            const normalizedPhone = phone.trim();
+
+            if (normalizedPhone && !isValidPhone(normalizedPhone)) {
+                return res.status(400).json({ message: 'Invalid phone format' });
+            }
+
+            user.phone = normalizedPhone;
         }
 
         await user.save();
@@ -256,8 +325,8 @@ exports.changePassword = async (req, res) => {
             return res.status(400).json({ message: 'currentPassword and newPassword are required' });
         }
 
-        if (String(newPassword).length < 6) {
-            return res.status(400).json({ message: 'New password must be at least 6 characters' });
+        if (!isStrongPassword(newPassword)) {
+            return res.status(400).json({ message: passwordRequirementMessage });
         }
 
         const user = await User.findById(req.user._id).select('+password');
@@ -344,8 +413,8 @@ exports.resetPassword = async (req, res) => {
             return res.status(400).json({ message: 'token and newPassword are required' });
         }
 
-        if (String(newPassword).length < 6) {
-            return res.status(400).json({ message: 'New password must be at least 6 characters' });
+        if (!isStrongPassword(newPassword)) {
+            return res.status(400).json({ message: passwordRequirementMessage });
         }
 
         const hashedToken = crypto.createHash('sha256').update(token).digest('hex');

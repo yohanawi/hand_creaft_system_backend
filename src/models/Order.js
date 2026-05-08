@@ -9,6 +9,48 @@ const orderItemVariantSchema = new mongoose.Schema({
     sku: { type: String, default: '', trim: true },
 }, { _id: false });
 
+const sellerFulfillmentSchema = new mongoose.Schema({
+    seller: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null,
+    },
+    shopName: { type: String, default: '', trim: true },
+    status: {
+        type: String,
+        enum: [
+            'awaiting_payment',
+            'payment_failed',
+            'pending',
+            'confirmed',
+            'processing',
+            'shipped',
+            'out_for_delivery',
+            'delivered',
+            'cancelled',
+            'returned',
+        ],
+        default: 'pending',
+    },
+    trackingNumber: { type: String, default: '', trim: true },
+    courier: { type: String, default: '', trim: true },
+    estimatedDelivery: { type: Date, default: null },
+    updatedAt: { type: Date, default: null },
+    grossAmount: { type: Number, default: 0, min: 0 },
+    platformFeeRate: { type: Number, default: 0, min: 0 },
+    platformFeeAmount: { type: Number, default: 0, min: 0 },
+    sellerNetAmount: { type: Number, default: 0, min: 0 },
+    payoutStatus: {
+        type: String,
+        enum: ['unpaid', 'available', 'requested', 'paid', 'reversed'],
+        default: 'unpaid',
+    },
+    inventoryReleased: {
+        type: Boolean,
+        default: false,
+    },
+}, { _id: false });
+
 const orderItemSchema = new mongoose.Schema({
     product: {
         type: mongoose.Schema.Types.ObjectId,
@@ -23,6 +65,10 @@ const orderItemSchema = new mongoose.Schema({
     sku: { type: String, default: '' },
     selectedVariant: {
         type: orderItemVariantSchema,
+        default: () => ({}),
+    },
+    sellerFulfillment: {
+        type: sellerFulfillmentSchema,
         default: () => ({}),
     },
 });
@@ -42,6 +88,9 @@ const trackingEventSchema = new mongoose.Schema({
     status: { type: String, required: true },
     message: { type: String, required: true },
     location: { type: String, default: '' },
+    performedById: { type: String, default: '' },
+    performedByName: { type: String, default: '' },
+    performedByRole: { type: String, default: '' },
     timestamp: { type: Date, default: Date.now },
 });
 
@@ -150,13 +199,12 @@ const orderSchema = new mongoose.Schema(
 );
 
 // Auto-generate order number before saving
-orderSchema.pre('save', function (next) {
+orderSchema.pre('save', function () {
     if (!this.orderNumber) {
         const ts = Date.now().toString(36).toUpperCase();
         const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
         this.orderNumber = `HC-${ts}-${rand}`;
     }
-    next();
 });
 
 module.exports = mongoose.model('Order', orderSchema);

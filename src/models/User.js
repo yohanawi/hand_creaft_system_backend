@@ -91,6 +91,147 @@ const cartVariantSchema = new mongoose.Schema(
     { _id: false }
 );
 
+const sellerProfileSchema = new mongoose.Schema(
+    {
+        shopName: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        shopSlug: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        bio: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        logo: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        banner: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        contactEmail: {
+            type: String,
+            default: '',
+            trim: true,
+            lowercase: true,
+        },
+        contactPhone: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        addressLine1: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        addressLine2: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        city: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        state: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        postalCode: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        country: {
+            type: String,
+            default: 'US',
+            trim: true,
+        },
+        instagramHandle: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        facebookUrl: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        materials: {
+            type: [String],
+            default: [],
+        },
+        processingTimeLabel: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        shippingPolicy: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        returnPolicy: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        bankName: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        accountHolderName: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        accountNumber: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        routingNumber: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        payoutEmail: {
+            type: String,
+            default: '',
+            trim: true,
+            lowercase: true,
+        },
+        adminNotes: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        rejectionReason: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        reviewedAt: {
+            type: Date,
+            default: null,
+        },
+    },
+    { _id: false }
+);
+
 const userSchema = new mongoose.Schema(
     {
         name: {
@@ -116,8 +257,17 @@ const userSchema = new mongoose.Schema(
         },
         role: {
             type: String,
-            enum: ['user', 'admin'],
+            enum: ['user', 'seller', 'admin'],
             default: 'user',
+        },
+        sellerStatus: {
+            type: String,
+            enum: ['inactive', 'pending', 'approved', 'rejected', 'suspended'],
+            default: 'inactive',
+        },
+        sellerProfile: {
+            type: sellerProfileSchema,
+            default: () => ({}),
         },
         cart: [
             {
@@ -190,6 +340,18 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.pre('save', function () {
+    if (this.role === 'seller' && this.sellerStatus === 'inactive') {
+        this.sellerStatus = 'approved';
+    }
+
+    if (this.role !== 'seller' && this.sellerStatus !== 'inactive') {
+        this.sellerStatus = 'inactive';
+    }
+
+    if (!this.sellerProfile.shopName && this.role === 'seller') {
+        this.sellerProfile.shopName = this.name;
+    }
+
     if (!Array.isArray(this.addresses) || this.addresses.length === 0) {
         return;
     }

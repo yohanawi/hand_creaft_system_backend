@@ -38,6 +38,13 @@ const categorySchema = new mongoose.Schema(
             enum: ["active", "inactive"],
             default: "active",
         },
+
+        displayOrder: {
+            type: Number,
+            default: 0,
+            min: 0,
+            index: true,
+        },
     },
     { timestamps: true }
 );

@@ -1,5 +1,6 @@
 const SupportTicket = require('../models/SupportTicket');
 const User = require('../models/User');
+const { logAdminActivity } = require('../utils/activityLogger');
 
 const TICKET_CATEGORIES = ['order', 'payment', 'shipping', 'product', 'technical', 'account', 'general'];
 const TICKET_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
@@ -223,6 +224,7 @@ exports.adminReplyToTicket = async (req, res) => {
         if (!ticket) {
             return res.status(404).json({ message: 'Ticket not found' });
         }
+        const before = ticket.toObject();
 
         appendMessage(ticket, {
             senderType: 'admin',
@@ -244,6 +246,17 @@ exports.adminReplyToTicket = async (req, res) => {
         }
 
         await ticket.save();
+
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'support_ticket',
+            resourceId: ticket._id,
+            resourceName: ticket.ticketNumber,
+            before,
+            after: ticket,
+        });
+
         res.json({ message: 'Reply added successfully', ticket });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -256,6 +269,7 @@ exports.adminUpdateTicket = async (req, res) => {
         if (!ticket) {
             return res.status(404).json({ message: 'Ticket not found' });
         }
+        const before = ticket.toObject();
 
         const { status, priority, category, adminAssigneeId, tags } = req.body;
 
@@ -293,6 +307,17 @@ exports.adminUpdateTicket = async (req, res) => {
         if (ticket.status !== 'resolved') ticket.resolvedAt = null;
 
         await ticket.save();
+
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'support_ticket',
+            resourceId: ticket._id,
+            resourceName: ticket.ticketNumber,
+            before,
+            after: ticket,
+        });
+
         res.json({ message: 'Ticket updated successfully', ticket });
     } catch (error) {
         res.status(500).json({ message: error.message });

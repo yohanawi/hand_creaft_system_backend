@@ -10,170 +10,49 @@
  *  4. indexAllProducts  — bulk-index every product that has an image
  */
 
-const axios = require("axios");
-const FormData = require("form-data");
 const fs = require("fs");
-const path = require("path");
 const Product = require("../models/Product");
+const {
+    AI_SERVICE_URL,
+    buildAiServiceFailurePayload,
+    cosineSimilarity,
+    extractProductFeatures,
+    getAiCatalogStats,
+    getAiServiceHealth,
+    getProductImageSignature,
+    getProductImageSource,
+    hasFreshAiFeatures,
+    indexProductDocument,
+    isProductAiEligible,
+    markProductAiIndexStale,
+    serializeAiProduct,
+} = require("../utils/aiSearch");
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://localhost:5001";
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+function buildVisualMatches(products, queryFeatures) {
+    const sorted = products
+        .map((product) => ({
+            product: serializeAiProduct(product),
+            score: cosineSimilarity(queryFeatures, product.features),
+        }))
+        .filter((entry) => Number.isFinite(entry.score) && entry.score >= 0.18)
+        .sort((left, right) => {
+            if (right.score !== left.score) {
+                return right.score - left.score;
+            }
 
-/**
- * Cosine similarity between two numeric arrays.
- * Returns a value in [-1, 1]; higher = more similar.
- */
-function cosineSimilarity(vecA, vecB) {
-    if (!vecA || !vecB || vecA.length === 0 || vecB.length === 0) return 0;
-    if (vecA.length !== vecB.length) return 0;
+            const rightInStock = right.product.availabilityStatus !== 'out_of_stock' && Number(right.product.quantity || 0) > 0;
+            const leftInStock = left.product.availabilityStatus !== 'out_of_stock' && Number(left.product.quantity || 0) > 0;
+            const stockDelta = Number(rightInStock) - Number(leftInStock);
+            if (stockDelta !== 0) {
+                return stockDelta;
+            }
 
-    let dot = 0;
-    let normA = 0;
-    let normB = 0;
+            return Number(Boolean(right.product.isFeatured)) - Number(Boolean(left.product.isFeatured));
+        });
 
-    for (let i = 0; i < vecA.length; i++) {
-        dot += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
-        normB += vecB[i] * vecB[i];
-    }
-
-    normA = Math.sqrt(normA);
-    normB = Math.sqrt(normB);
-
-    if (normA === 0 || normB === 0) return 0;
-    return dot / (normA * normB);
-}
-
-/**
- * Send a local file to the Python AI service and get back a feature vector.
- * @param {string} filePath - absolute path to the image on disk
- * @returns {number[]} 1280-dimensional feature vector
- */
-async function extractFeaturesFromFile(filePath) {
-    const form = new FormData();
-    form.append("image", fs.createReadStream(filePath));
-
-    const response = await axios.post(`${AI_SERVICE_URL}/extract`, form, {
-        headers: form.getHeaders(),
-        timeout: 60000, // 60 s — model cold-start can be slow
-    });
-
-    if (!response.data || !response.data.features) {
-        throw new Error("AI service returned no features");
-    }
-    return response.data.features;
-}
-
-/**
- * Send an image URL to the Python AI service and get back a feature vector.
- * Used when indexing existing products whose images are already hosted.
- * @param {string} imageUrl
- * @returns {number[]}
- */
-async function extractFeaturesFromUrl(imageUrl) {
-    const response = await axios.post(
-        `${AI_SERVICE_URL}/extract-url`,
-        { url: imageUrl },
-        {
-            headers: { "Content-Type": "application/json" },
-            timeout: 60000,
-        }
-    );
-
-    if (!response.data || !response.data.features) {
-        throw new Error("AI service returned no features");
-    }
-    return response.data.features;
-}
-
-/**
- * Resolve the best image URL / path for a product.
- * Falls back through: thumbnailImage → first image in images[]
- */
-function getProductImageSource(product) {
-    if (product.thumbnailImage) return product.thumbnailImage;
-    if (Array.isArray(product.images) && product.images.length > 0) {
-        return product.images[0];
-    }
-    return null;
-}
-
-/**
- * Decide whether an image source is a remote URL or a local file path.
- */
-function isUrl(src) {
-    return src.startsWith("http://") || src.startsWith("https://");
-}
-
-function normalizeImageSource(src) {
-    return String(src || "").trim();
-}
-
-function tryResolveUploadPath(src) {
-    const normalized = normalizeImageSource(src);
-    if (!normalized) return null;
-
-    const uploadsIndex = normalized.toLowerCase().indexOf('/uploads/');
-    if (uploadsIndex >= 0) {
-        const relativePath = normalized.slice(uploadsIndex + 1).replace(/\//g, path.sep);
-        return path.join(process.cwd(), relativePath);
-    }
-
-    if (normalized.toLowerCase().startsWith('uploads/')) {
-        return path.join(process.cwd(), normalized.replace(/\//g, path.sep));
-    }
-
-    return null;
-}
-
-function resolveLocalImagePath(src) {
-    const normalized = normalizeImageSource(src);
-    if (!normalized) {
-        throw new Error('Empty image source');
-    }
-
-    const uploadPath = tryResolveUploadPath(normalized);
-    if (uploadPath) {
-        return uploadPath;
-    }
-
-    if (path.isAbsolute(normalized)) {
-        return normalized;
-    }
-
-    return path.join(process.cwd(), normalized.replace(/\//g, path.sep));
-}
-
-async function getAiServiceHealth() {
-    const response = await axios.get(`${AI_SERVICE_URL}/health`, {
-        timeout: 10000,
-    });
-    return response.data;
-}
-
-async function extractProductFeatures(imageSrc) {
-    const normalized = normalizeImageSource(imageSrc);
-    if (!normalized) {
-        throw new Error('Product has no image source');
-    }
-
-    if (isUrl(normalized)) {
-        const localUploadPath = tryResolveUploadPath(normalized);
-        if (localUploadPath && fs.existsSync(localUploadPath)) {
-            return extractFeaturesFromFile(localUploadPath);
-        }
-
-        return extractFeaturesFromUrl(normalized);
-    }
-
-    const absolutePath = resolveLocalImagePath(normalized);
-    if (!fs.existsSync(absolutePath)) {
-        throw new Error(`Image file not found: ${absolutePath}`);
-    }
-
-    return extractFeaturesFromFile(absolutePath);
+    return sorted.slice(0, 12);
 }
 
 // ─── Controllers ──────────────────────────────────────────────────────────────
@@ -194,14 +73,34 @@ exports.searchByImage = async (req, res) => {
         // ── 2. Ask AI service for query-image features ─────────────────────
         let queryFeatures;
         try {
-            queryFeatures = await extractFeaturesFromFile(req.file.path);
+            queryFeatures = await extractProductFeatures(req.file.path);
         } catch (aiError) {
-            // Clean up temp file before returning
-            fs.unlink(req.file.path, () => { });
+            const failure = buildAiServiceFailurePayload(
+                aiError,
+                'AI service is unavailable. Make sure the Python service is running on port 5001.',
+            );
+
+            if (failure.statusCode < 500) {
+                return res.status(failure.statusCode).json(failure);
+            }
+
+            const [catalog, aiHealth] = await Promise.all([
+                getAiCatalogStats().catch(() => ({
+                    total: 0,
+                    indexed: 0,
+                    pending: 0,
+                    productsWithImages: 0,
+                    productsMissingImages: 0,
+                    percentComplete: 0,
+                    ready: false,
+                })),
+                getAiServiceHealth().catch(() => ({ healthy: false, serviceUrl: AI_SERVICE_URL })),
+            ]);
+
             return res.status(503).json({
-                message:
-                    "AI service is unavailable. Make sure the Python service is running on port 5001.",
-                error: aiError.message,
+                ...failure,
+                aiService: aiHealth,
+                catalog,
             });
         } finally {
             // Remove the temp upload regardless of outcome
@@ -211,47 +110,31 @@ exports.searchByImage = async (req, res) => {
         }
 
         // ── 3. Load all indexed products (features included via +features) ──
-        const products = await Product.find({ featuresIndexed: true })
-            .select("+features")
+        const products = await Product.find({
+            status: 'active',
+            isArchived: { $ne: true },
+            featuresIndexed: true,
+        })
+            .select('+features name slug description price salePrice currency thumbnailImage images category subcategory material color availabilityStatus quantity isFeatured sku tags averageRating reviewCount featuresIndexed featuresImageSignature')
             .populate("category", "name")
             .populate("subcategory", "name")
             .lean();
 
-        if (products.length === 0) {
+        const freshProducts = products.filter(hasFreshAiFeatures);
+
+        if (freshProducts.length === 0) {
+            const catalog = await getAiCatalogStats();
             return res.json({
                 message:
                     "No products are AI-indexed yet. Ask an admin to run the indexing step.",
+                catalog,
                 results: [],
                 total: 0,
             });
         }
 
         // ── 4. Score every product ────────────────────────────────────────
-        const LIMIT = 10; // return top 10 matches
-
-        const scored = products
-            .map((p) => ({
-                product: {
-                    _id: p._id,
-                    name: p.name,
-                    slug: p.slug,
-                    price: p.price,
-                    salePrice: p.salePrice,
-                    currency: p.currency,
-                    thumbnailImage: p.thumbnailImage,
-                    images: p.images,
-                    category: p.category,
-                    subcategory: p.subcategory,
-                    material: p.material,
-                    color: p.color,
-                    availabilityStatus: p.availabilityStatus,
-                    isFeatured: p.isFeatured,
-                },
-                score: cosineSimilarity(queryFeatures, p.features),
-            }))
-            .filter((item) => item.score > 0.3) // discard very low matches
-            .sort((a, b) => b.score - a.score)
-            .slice(0, LIMIT);
+        const scored = buildVisualMatches(freshProducts, queryFeatures);
 
         res.json({
             message: `Found ${scored.length} similar product(s).`,
@@ -266,16 +149,34 @@ exports.searchByImage = async (req, res) => {
 
 exports.getAiHealth = async (req, res) => {
     try {
-        const health = await getAiServiceHealth();
+        const [health, catalog] = await Promise.all([
+            getAiServiceHealth(),
+            getAiCatalogStats(),
+        ]);
+
         res.json({
-            healthy: true,
+            healthy: Boolean(health?.healthy),
+            ready: catalog.ready,
             serviceUrl: AI_SERVICE_URL,
+            catalog,
             ...health,
         });
     } catch (error) {
+        const catalog = await getAiCatalogStats().catch(() => ({
+            total: 0,
+            indexed: 0,
+            pending: 0,
+            productsWithImages: 0,
+            productsMissingImages: 0,
+            percentComplete: 0,
+            ready: false,
+        }));
+
         res.status(503).json({
             healthy: false,
+            ready: false,
             serviceUrl: AI_SERVICE_URL,
+            catalog,
             message: 'AI service is unavailable',
             error: error.message,
         });
@@ -293,22 +194,24 @@ exports.indexProduct = async (req, res) => {
             return res.status(404).json({ message: "Product not found." });
         }
 
-        const imageSrc = getProductImageSource(product);
-        if (!imageSrc) {
+        if (!getProductImageSource(product)) {
             return res
                 .status(400)
                 .json({ message: "Product has no image to index." });
         }
 
-        const features = await extractProductFeatures(imageSrc);
+        if (!isProductAiEligible(product)) {
+            return res.status(400).json({
+                message: 'Only active, non-archived products can be indexed.',
+            });
+        }
 
-        product.features = features;
-        product.featuresIndexed = true;
-        await product.save();
+        const features = await indexProductDocument(product);
 
         res.json({
             message: `Product "${product.name}" indexed successfully.`,
             featureSize: features.length,
+            imageSignature: getProductImageSignature(product),
         });
     } catch (error) {
         console.error("indexProduct error:", error);
@@ -323,8 +226,8 @@ exports.indexProduct = async (req, res) => {
  */
 exports.indexAllProducts = async (req, res) => {
     try {
-        const products = await Product.find({ status: "active" }).select(
-            "+features thumbnailImage images name"
+        const products = await Product.find({ status: "active", isArchived: { $ne: true } }).select(
+            "+features thumbnailImage images name featuresIndexed featuresImageSignature"
         );
 
         const total = products.length;
@@ -336,20 +239,24 @@ exports.indexAllProducts = async (req, res) => {
         for (const product of products) {
             const imageSrc = getProductImageSource(product);
             if (!imageSrc) {
+                if (markProductAiIndexStale(product)) {
+                    await product.save();
+                }
+                skipped++;
+                continue;
+            }
+
+            if (hasFreshAiFeatures(product)) {
                 skipped++;
                 continue;
             }
 
             try {
-                const features = await extractProductFeatures(imageSrc);
-
-                await Product.findByIdAndUpdate(product._id, {
-                    features,
-                    featuresIndexed: true,
-                });
+                await indexProductDocument(product);
                 indexed++;
             } catch (err) {
                 failed++;
+                console.error(`AI indexing failed for ${product._id} (${product.name}):`, err.message);
                 errors.push({ productId: product._id, name: product.name, error: err.message });
             }
         }
@@ -374,30 +281,34 @@ exports.indexAllProducts = async (req, res) => {
  */
 exports.getIndexStatus = async (req, res) => {
     try {
-        const [total, indexed, productsWithImages, samplePending, aiHealth] = await Promise.all([
-            Product.countDocuments({ status: "active" }),
-            Product.countDocuments({ featuresIndexed: true }),
-            Product.countDocuments({
-                status: 'active',
-                $or: [
-                    { thumbnailImage: { $exists: true, $ne: null, $ne: '' } },
-                    { 'images.0': { $exists: true } },
-                ],
-            }),
-            Product.find({ status: 'active', featuresIndexed: { $ne: true } })
-                .select('name sku thumbnailImage images updatedAt')
-                .limit(8)
+        const [catalog, pendingCandidates, aiHealth] = await Promise.all([
+            getAiCatalogStats(),
+            Product.find({ status: 'active', isArchived: { $ne: true } })
+                .select('+features name sku thumbnailImage images updatedAt featuresIndexed featuresImageSignature')
                 .lean(),
             getAiServiceHealth().catch((error) => ({ healthy: false, error: error.message })),
         ]);
 
+        const samplePending = pendingCandidates
+            .filter((product) => !hasFreshAiFeatures(product))
+            .slice(0, 8)
+            .map(({ _id, name, sku, thumbnailImage, images, updatedAt }) => ({
+                _id,
+                name,
+                sku,
+                thumbnailImage,
+                images,
+                updatedAt,
+            }));
+
         res.json({
-            total,
-            indexed,
-            pending: total - indexed,
-            productsWithImages,
-            productsMissingImages: Math.max(total - productsWithImages, 0),
-            percentComplete: total > 0 ? Math.round((indexed / total) * 100) : 0,
+            total: catalog.total,
+            indexed: catalog.indexed,
+            pending: catalog.pending,
+            productsWithImages: catalog.productsWithImages,
+            productsMissingImages: catalog.productsMissingImages,
+            percentComplete: catalog.percentComplete,
+            ready: catalog.ready,
             aiService: aiHealth?.healthy === false
                 ? { healthy: false, error: aiHealth.error, serviceUrl: AI_SERVICE_URL }
                 : { healthy: true, serviceUrl: AI_SERVICE_URL, model: aiHealth.model, feature_vector_size: aiHealth.feature_vector_size },

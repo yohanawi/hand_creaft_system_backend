@@ -1,5 +1,6 @@
 const Blog = require("../models/Blog");
 const slugify = require("slugify");
+const { logAdminActivity } = require('../utils/activityLogger');
 
 const parseBoolean = (value) => {
     if (typeof value === "boolean") return value;
@@ -75,6 +76,16 @@ exports.createBlog = async (req, res) => {
         });
 
         await blog.save();
+
+        await logAdminActivity({
+            req,
+            action: 'create',
+            resourceType: 'blog',
+            resourceId: blog._id,
+            resourceName: blog.title,
+            before: null,
+            after: blog,
+        });
 
         res.status(201).json({
             success: true,
@@ -153,6 +164,7 @@ exports.updateBlog = async (req, res) => {
         const blog = await Blog.findById(req.params.id);
 
         if (!blog) return res.status(404).json({ message: "Not found" });
+        const before = blog.toObject();
 
         if (typeof body.title === "string" && body.title.trim()) {
             blog.title = body.title;
@@ -194,6 +206,16 @@ exports.updateBlog = async (req, res) => {
 
         await blog.save();
 
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'blog',
+            resourceId: blog._id,
+            resourceName: blog.title,
+            before,
+            after: blog,
+        });
+
         res.json({ success: true, data: blog });
     } catch (error) {
         if (error?.code === 11000) {
@@ -208,7 +230,21 @@ exports.updateBlog = async (req, res) => {
 ================================ */
 exports.deleteBlog = async (req, res) => {
     try {
-        await Blog.findByIdAndDelete(req.params.id);
+        const deleted = await Blog.findByIdAndDelete(req.params.id);
+        if (!deleted) {
+            return res.status(404).json({ message: 'Not found' });
+        }
+
+        await logAdminActivity({
+            req,
+            action: 'delete',
+            resourceType: 'blog',
+            resourceId: deleted._id,
+            resourceName: deleted.title,
+            before: deleted,
+            after: null,
+        });
+
         res.json({ success: true, message: "Deleted successfully" });
     } catch (error) {
         res.status(500).json({ message: error.message });

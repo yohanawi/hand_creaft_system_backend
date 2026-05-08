@@ -1,6 +1,7 @@
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const { createStockMovement, syncAvailabilityStatus } = require('../utils/inventory');
+const { logAdminActivity } = require('../utils/activityLogger');
 
 const buildSeverity = (product) => {
     const quantity = Number(product.quantity || 0);
@@ -136,6 +137,7 @@ exports.restockProduct = async (req, res) => {
         if (!product) {
             return res.status(404).json({ message: 'Product not found' });
         }
+        const before = product.toObject();
 
         const previousQuantity = Number(product.quantity || 0);
         product.quantity = previousQuantity + quantity;
@@ -153,6 +155,16 @@ exports.restockProduct = async (req, res) => {
             referenceType: 'admin_restock',
             referenceId: String(product._id),
             performedBy: req.user?._id || null,
+        });
+
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'inventory',
+            resourceId: product._id,
+            resourceName: product.name,
+            before,
+            after: product,
         });
 
         res.json({ message: 'Product restocked successfully', product });
@@ -175,6 +187,7 @@ exports.adjustProductStock = async (req, res) => {
         if (!product) {
             return res.status(404).json({ message: 'Product not found' });
         }
+        const before = product.toObject();
 
         const previousQuantity = Number(product.quantity || 0);
         const nextQuantity = previousQuantity + quantityDelta;
@@ -198,6 +211,16 @@ exports.adjustProductStock = async (req, res) => {
             referenceType: 'admin_adjustment',
             referenceId: String(product._id),
             performedBy: req.user?._id || null,
+        });
+
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'inventory',
+            resourceId: product._id,
+            resourceName: product.name,
+            before,
+            after: product,
         });
 
         res.json({ message: 'Stock adjusted successfully', product });

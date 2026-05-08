@@ -10,6 +10,7 @@ router.use('/coupons', require('./couponRoutes'));
 router.use('/blogs', require('./blogRoutes'));
 router.use('/ai-search', require('./aiSearchRoutes'));
 router.use('/admin', require('./adminRoutes'));
+router.use('/seller', require('./sellerRoutes'));
 router.use('/orders', require('./orderRoutes'));
 router.use('/payments', require('./paymentRoutes'));
 router.use('/cart', require('./cartRoutes'));

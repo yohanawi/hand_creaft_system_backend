@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect } = require('../middlewares/authMiddleware');
 const paymentController = require('../controllers/paymentController');
 
+router.get('/payhere/status', paymentController.getPayHereStatus);
 router.post('/payhere/initiate', protect, paymentController.createPayHereSession);
 router.post('/payhere/orders/:orderId/cancel', protect, paymentController.cancelPayHereOrder);
 router.get('/payhere/checkout/:orderId', paymentController.renderPayHereCheckout);

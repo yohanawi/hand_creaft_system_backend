@@ -65,6 +65,16 @@ const ensurePayHereConfigured = () => {
     return null;
 };
 
+exports.getPayHereStatus = (req, res) => {
+    const configError = ensurePayHereConfigured();
+
+    res.json({
+        available: !configError,
+        message: configError || 'PayHere is available',
+        sandbox: String(process.env.PAYHERE_SANDBOX || 'true').toLowerCase() !== 'false',
+    });
+};
+
 const appendTrackingEvent = (order, status, message, location = '') => {
     order.trackingEvents.push({
         status,

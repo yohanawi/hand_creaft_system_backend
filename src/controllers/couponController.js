@@ -1,4 +1,5 @@
 const Coupon = require('../models/Coupon');
+const { logAdminActivity } = require('../utils/activityLogger');
 
 const normalizeCouponPayload = (body = {}) => {
     const type = body.type;
@@ -20,6 +21,10 @@ const normalizeCouponPayload = (body = {}) => {
         return { error: 'Coupon value must be greater than 0' };
     }
 
+    if (type === 'percentage' && value > 100) {
+        return { error: 'Percentage discounts must be between 0 and 100' };
+    }
+
     if (!Number.isFinite(minOrderAmount) || minOrderAmount < 0) {
         return { error: 'minOrderAmount must be 0 or greater' };
     }
@@ -34,6 +39,10 @@ const normalizeCouponPayload = (body = {}) => {
 
     if (expiresAt && Number.isNaN(expiresAt.getTime())) {
         return { error: 'expiresAt must be a valid date' };
+    }
+
+    if (expiresAt && expiresAt <= new Date()) {
+        return { error: 'expiresAt must be in the future' };
     }
 
     return {
@@ -135,6 +144,17 @@ exports.createCoupon = async (req, res) => {
         }
 
         const coupon = await Coupon.create(normalized.value);
+
+        await logAdminActivity({
+            req,
+            action: 'create',
+            resourceType: 'coupon',
+            resourceId: coupon._id,
+            resourceName: coupon.code,
+            before: null,
+            after: coupon,
+        });
+
         res.status(201).json(coupon);
     } catch (error) {
         if (error?.code === 11000) {
@@ -150,6 +170,7 @@ exports.updateCoupon = async (req, res) => {
         if (!coupon) {
             return res.status(404).json({ message: 'Coupon not found' });
         }
+        const before = coupon.toObject();
 
         const normalized = normalizeCouponPayload({ ...coupon.toObject(), ...req.body, code: req.body.code ?? coupon.code });
         if (normalized.error) {
@@ -158,6 +179,17 @@ exports.updateCoupon = async (req, res) => {
 
         Object.assign(coupon, normalized.value);
         await coupon.save();
+
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'coupon',
+            resourceId: coupon._id,
+            resourceName: coupon.code,
+            before,
+            after: coupon,
+        });
+
         res.json(coupon);
     } catch (error) {
         if (error?.code === 11000) {
@@ -173,6 +205,16 @@ exports.deleteCoupon = async (req, res) => {
         if (!coupon) {
             return res.status(404).json({ message: 'Coupon not found' });
         }
+
+        await logAdminActivity({
+            req,
+            action: 'delete',
+            resourceType: 'coupon',
+            resourceId: coupon._id,
+            resourceName: coupon.code,
+            before: coupon,
+            after: null,
+        });
 
         res.json({ message: 'Coupon deleted successfully' });
     } catch (error) {

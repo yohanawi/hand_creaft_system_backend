@@ -154,6 +154,24 @@ const productSchema = new mongoose.Schema(
             required: true,
         },
 
+        seller: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
+            default: null,
+            index: true,
+        },
+
+        sellerShopName: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+
+        sellerVisibilityBlocked: {
+            type: Boolean,
+            default: false,
+        },
+
         subcategory: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Subcategory",
@@ -181,8 +199,19 @@ const productSchema = new mongoose.Schema(
 
         status: {
             type: String,
-            enum: ["active", "inactive"],
+            enum: ["active", "inactive", "archived"],
             default: "active",
+        },
+
+        isArchived: {
+            type: Boolean,
+            default: false,
+            index: true,
+        },
+
+        archivedAt: {
+            type: Date,
+            default: null,
         },
 
         isFeatured: {
@@ -234,6 +263,12 @@ const productSchema = new mongoose.Schema(
             default: false,
         },
 
+        featuresImageSignature: {
+            type: String,
+            default: "",
+            trim: true,
+        },
+
         averageRating: {
             type: Number,
             default: 0,
@@ -271,7 +306,7 @@ const productSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-productSchema.pre("validate", function (next) {
+productSchema.pre("validate", function () {
     if (Array.isArray(this.variants) && this.variants.length > 0) {
         let defaultSeen = false;
 
@@ -301,12 +336,65 @@ productSchema.pre("validate", function (next) {
         );
     }
 
-    next();
+});
+
+function getCurrentAiImageSignature(product) {
+    const thumbnailImage = String(product?.thumbnailImage || '').trim();
+    if (thumbnailImage) {
+        return thumbnailImage;
+    }
+
+    if (Array.isArray(product?.images) && product.images.length > 0) {
+        return String(product.images[0] || '').trim();
+    }
+
+    return '';
+}
+
+productSchema.pre("save", function () {
+    const imageChanged = this.isModified("thumbnailImage") || this.isModified("images");
+    const activationChanged = this.isModified("status") || this.isModified("isArchived");
+    const hasImage = Boolean(getCurrentAiImageSignature(this));
+    const isEligible = this.status === 'active' && this.isArchived !== true;
+
+    this.$locals = this.$locals || {};
+    this.$locals.aiShouldRefresh = false;
+    this.$locals.aiRefreshReason = 'catalog-update';
+
+    if (imageChanged) {
+        this.features = [];
+        this.featuresIndexed = false;
+        this.featuresImageSignature = '';
+        this.$locals.aiRefreshReason = 'image-updated';
+    }
+
+    if ((this.isNew || imageChanged || activationChanged) && isEligible && hasImage) {
+        this.$locals.aiShouldRefresh = true;
+
+        if (this.isNew) {
+            this.$locals.aiRefreshReason = 'product-created';
+        } else if (activationChanged && !imageChanged) {
+            this.$locals.aiRefreshReason = 'product-activated';
+        }
+    }
 });
 
 productSchema.pre("save", function () {
     if (!this.slug) {
         this.slug = slugify(this.name, { lower: true });
+    }
+});
+
+productSchema.post("save", function (doc) {
+    if (!doc?.$locals?.aiShouldRefresh) {
+        return;
+    }
+
+    try {
+        const { queueProductAiRefresh } = require("../utils/aiSearch");
+        queueProductAiRefresh(doc._id, doc.$locals.aiRefreshReason || 'catalog-update');
+    } catch (error) {
+        console.error(`AI auto-refresh queue failed for ${doc?._id}:`, error.message);
     }
 });
 

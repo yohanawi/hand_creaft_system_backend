@@ -56,3 +56,20 @@ exports.admin = (req, res, next) => {
   }
   return res.status(403).json({ message: 'Admin access required' });
 };
+
+exports.seller = (req, res, next) => {
+  if (req.user && req.user.role === 'seller') {
+    if (req.user.sellerStatus && ['rejected', 'suspended'].includes(req.user.sellerStatus)) {
+      return res.status(403).json({ message: 'Seller account is not active' });
+    }
+    return next();
+  }
+  return res.status(403).json({ message: 'Seller access required' });
+};
+
+exports.adminOrSeller = (req, res, next) => {
+  if (req.user && ['admin', 'seller'].includes(req.user.role)) {
+    return next();
+  }
+  return res.status(403).json({ message: 'Admin or seller access required' });
+};

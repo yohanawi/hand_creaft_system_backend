@@ -11,6 +11,7 @@ const {
     getVariantLabel,
     hasProductVariants,
 } = require('../utils/inventory');
+const { logAdminActivity } = require('../utils/activityLogger');
 
 const STATUS_MESSAGES = {
     awaiting_payment: 'Order created. Waiting for PayHere payment confirmation.',
@@ -58,6 +59,35 @@ const VALID_PAYMENT_STATUSES = [
     'refunded',
 ];
 
+const SELLER_EDITABLE_STATUSES = [
+    'confirmed',
+    'processing',
+    'shipped',
+    'out_for_delivery',
+    'delivered',
+    'cancelled',
+    'returned',
+];
+
+const ORDER_STATUS_PRIORITY = [
+    'awaiting_payment',
+    'payment_failed',
+    'pending',
+    'confirmed',
+    'processing',
+    'shipped',
+    'out_for_delivery',
+];
+
+const DEFAULT_PLATFORM_FEE_RATE = (() => {
+    const parsed = Number(process.env.SELLER_PLATFORM_FEE_RATE);
+    if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) {
+        return parsed;
+    }
+
+    return 0.12;
+})();
+
 const STATUS_TRANSITIONS = {
     awaiting_payment: ['awaiting_payment', 'confirmed', 'payment_failed', 'cancelled'],
     payment_failed: ['payment_failed', 'awaiting_payment', 'cancelled'],
@@ -69,6 +99,20 @@ const STATUS_TRANSITIONS = {
     delivered: ['delivered', 'returned'],
     cancelled: ['cancelled'],
     returned: ['returned'],
+};
+
+const ensurePayHereConfigured = () => {
+    const missing = [
+        'PAYHERE_MERCHANT_ID',
+        'PAYHERE_MERCHANT_SECRET',
+        'PAYHERE_NOTIFY_URL',
+    ].filter((key) => !process.env[key]);
+
+    if (missing.length > 0) {
+        return `PayHere is currently unavailable: missing ${missing.join(', ')}`;
+    }
+
+    return null;
 };
 
 const normalizeShippingAddress = (address = {}) => {
@@ -198,31 +242,150 @@ const appendTrackingEvent = (order, status, message, location = '') => {
     });
 };
 
+const isSellerOwnedItem = (item, sellerId) => (
+    String(item?.sellerFulfillment?.seller || '') === String(sellerId || '')
+);
+
+const getSellerItemsForOrder = (order, sellerId) => (
+    (order.items || []).filter((item) => isSellerOwnedItem(item, sellerId))
+);
+
+const getItemFulfillmentStatus = (item, fallback = 'pending') => (
+    String(item?.sellerFulfillment?.status || fallback)
+);
+
+const roundCurrency = (value) => Number(Number(value || 0).toFixed(2));
+
+const updateOrderReservationState = (order) => {
+    order.inventoryReserved = (order.items || []).some(
+        (item) => !Boolean(item?.sellerFulfillment?.inventoryReleased)
+    );
+};
+
+const deriveOrderStatusFromItems = (order) => {
+    const statuses = (order.items || []).map((item) => getItemFulfillmentStatus(item, order.status));
+
+    if (statuses.length === 0) {
+        return order.status;
+    }
+
+    const activeStatuses = statuses.filter((status) => !['delivered', 'cancelled', 'returned'].includes(status));
+    if (activeStatuses.length > 0) {
+        return ORDER_STATUS_PRIORITY.find((status) => activeStatuses.includes(status)) || activeStatuses[0];
+    }
+
+    if (statuses.every((status) => status === 'delivered')) {
+        return 'delivered';
+    }
+
+    if (statuses.every((status) => status === 'cancelled')) {
+        return 'cancelled';
+    }
+
+    if (statuses.every((status) => status === 'returned')) {
+        return 'returned';
+    }
+
+    if (statuses.every((status) => ['delivered', 'cancelled', 'returned'].includes(status))) {
+        if (statuses.includes('delivered')) {
+            return 'delivered';
+        }
+        if (statuses.includes('returned')) {
+            return 'returned';
+        }
+        return 'cancelled';
+    }
+
+    return order.status;
+};
+
+const getSellerOrderSlice = (order, sellerId) => {
+    const sellerItems = getSellerItemsForOrder(order, sellerId);
+    const sellerStatus = sellerItems[0]?.sellerFulfillment?.status || order.status;
+    const sellerTrackingNumber = sellerItems[0]?.sellerFulfillment?.trackingNumber || '';
+    const sellerCourier = sellerItems[0]?.sellerFulfillment?.courier || '';
+    const sellerEstimatedDelivery = sellerItems[0]?.sellerFulfillment?.estimatedDelivery || null;
+    const grossAmount = sellerItems.reduce(
+        (sum, item) => sum + Number(item?.sellerFulfillment?.grossAmount || 0),
+        0,
+    );
+    const netAmount = sellerItems.reduce(
+        (sum, item) => sum + Number(item?.sellerFulfillment?.sellerNetAmount || 0),
+        0,
+    );
+
+    return {
+        _id: order._id,
+        orderNumber: order.orderNumber,
+        createdAt: order.createdAt,
+        updatedAt: order.updatedAt,
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        customerNote: order.customerNote,
+        user: order.user,
+        shippingAddress: order.shippingAddress,
+        sellerStatus,
+        sellerTrackingNumber,
+        sellerCourier,
+        sellerEstimatedDelivery,
+        items: sellerItems,
+        summary: {
+            itemCount: sellerItems.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+            grossAmount: roundCurrency(grossAmount),
+            netAmount: roundCurrency(netAmount),
+        },
+    };
+};
+
+const restoreInventoryForOrderItem = async (order, item) => {
+    if (item?.sellerFulfillment?.inventoryReleased) {
+        return;
+    }
+
+    const product = await Product.findById(item.product);
+    if (!product) {
+        item.sellerFulfillment.inventoryReleased = true;
+        return;
+    }
+
+    const previousQuantity = Number(product.quantity || 0);
+    const { variantId, variant } = ensureRestorableVariant(product, item.selectedVariant);
+    applyInventoryRestore(product, Number(item.quantity || 0), variantId);
+    await product.save();
+
+    await createStockMovement({
+        product,
+        type: getItemFulfillmentStatus(item, order.status) === 'returned'
+            ? 'return_restock'
+            : getItemFulfillmentStatus(item, order.status) === 'cancelled'
+                ? 'cancellation_release'
+                : 'order_released',
+        reason: getItemFulfillmentStatus(item, order.status) === 'returned'
+            ? 'Returned stock added back to inventory'
+            : 'Reserved stock released back to inventory',
+        note: `Order ${order.orderNumber}`,
+        quantityChange: Number(item.quantity || 0),
+        previousQuantity,
+        newQuantity: Number(product.quantity || 0),
+        variant,
+        referenceType: 'order',
+        referenceId: String(order._id),
+        metadata: {
+            orderNumber: order.orderNumber,
+            sellerId: String(item?.sellerFulfillment?.seller || ''),
+        },
+    });
+
+    item.sellerFulfillment.inventoryReleased = true;
+};
+
 const restoreInventoryForOrder = async (order) => {
     if (!order.inventoryReserved) {
         return;
     }
 
     for (const item of order.items) {
-        const product = await Product.findById(item.product);
-        if (!product) continue;
-        const previousQuantity = Number(product.quantity || 0);
-        const { variantId, variant } = ensureRestorableVariant(product, item.selectedVariant);
-        applyInventoryRestore(product, Number(item.quantity || 0), variantId);
-        await product.save();
-        await createStockMovement({
-            product,
-            type: order.status === 'returned' ? 'return_restock' : order.status === 'cancelled' ? 'cancellation_release' : 'order_released',
-            reason: order.status === 'returned' ? 'Returned stock added back to inventory' : 'Reserved stock released back to inventory',
-            note: `Order ${order.orderNumber}`,
-            quantityChange: Number(item.quantity || 0),
-            previousQuantity,
-            newQuantity: Number(product.quantity || 0),
-            variant,
-            referenceType: 'order',
-            referenceId: String(order._id),
-            metadata: { orderNumber: order.orderNumber },
-        });
+        await restoreInventoryForOrderItem(order, item);
     }
 
     if (order.couponCode) {
@@ -233,7 +396,7 @@ const restoreInventoryForOrder = async (order) => {
         }
     }
 
-    order.inventoryReserved = false;
+    updateOrderReservationState(order);
 };
 
 const serializeOrder = (order) => order.toObject();
@@ -271,6 +434,13 @@ exports.placeOrder = async (req, res) => {
             return res.status(400).json({ message: 'Supported payment methods are cod and payhere' });
         }
 
+        if (normalizedPaymentMethod === 'payhere') {
+            const payHereConfigError = ensurePayHereConfigured();
+            if (payHereConfigError) {
+                return res.status(400).json({ message: payHereConfigError, code: 'PAYHERE_UNAVAILABLE' });
+            }
+        }
+
         if (!items || !Array.isArray(items) || items.length === 0) {
             return res.status(400).json({ message: 'Order must have at least one item' });
         }
@@ -300,10 +470,13 @@ exports.placeOrder = async (req, res) => {
             return res.status(400).json({ message: 'All shipping address fields are required' });
         }
 
+        const isPayHereOrder = normalizedPaymentMethod === 'payhere';
+
         // Validate products & build items
         let subtotal = 0;
         const orderItems = [];
         const productsToUpdate = [];
+        const sellerCache = new Map();
 
         for (const item of items) {
             const product = await Product.findById(item.product);
@@ -336,6 +509,25 @@ exports.placeOrder = async (req, res) => {
             const lineTotal = pricing.unitPrice * requestedQuantity;
             subtotal += lineTotal;
 
+            let sellerUser = null;
+            if (product.seller) {
+                const sellerId = String(product.seller);
+                if (!sellerCache.has(sellerId)) {
+                    sellerCache.set(
+                        sellerId,
+                        await User.findById(product.seller)
+                            .select('name sellerProfile.shopName')
+                            .lean(),
+                    );
+                }
+                sellerUser = sellerCache.get(sellerId);
+            }
+
+            const platformFeeRate = DEFAULT_PLATFORM_FEE_RATE;
+            const platformFeeAmount = roundCurrency(lineTotal * platformFeeRate);
+            const sellerNetAmount = roundCurrency(lineTotal - platformFeeAmount);
+            const sellerStatus = isPayHereOrder ? 'awaiting_payment' : 'pending';
+
             orderItems.push({
                 product: product._id,
                 name: product.name,
@@ -345,6 +537,20 @@ exports.placeOrder = async (req, res) => {
                 quantity: requestedQuantity,
                 sku: String(variant?.sku || product.sku || ''),
                 selectedVariant,
+                sellerFulfillment: {
+                    seller: product.seller || null,
+                    shopName: String(product.sellerShopName || sellerUser?.sellerProfile?.shopName || sellerUser?.name || 'HandCraft').trim(),
+                    status: sellerStatus,
+                    trackingNumber: '',
+                    courier: '',
+                    grossAmount: roundCurrency(lineTotal),
+                    platformFeeRate,
+                    platformFeeAmount,
+                    sellerNetAmount,
+                    payoutStatus: 'unpaid',
+                    inventoryReleased: false,
+                    updatedAt: new Date(),
+                },
             });
 
             const previousQuantity = Number(product.quantity || 0);
@@ -382,7 +588,6 @@ exports.placeOrder = async (req, res) => {
         const taxableAmount = Math.max(0, subtotal - discount);
         const tax = parseFloat((taxableAmount * 0.1).toFixed(2));
         const total = parseFloat((taxableAmount + shippingCost + tax).toFixed(2));
-        const isPayHereOrder = normalizedPaymentMethod === 'payhere';
         const initialStatus = isPayHereOrder ? 'awaiting_payment' : 'pending';
         const initialPaymentStatus = isPayHereOrder ? 'awaiting_payment' : 'cod_due';
 
@@ -402,8 +607,8 @@ exports.placeOrder = async (req, res) => {
             couponCode: appliedCouponCode,
             total,
             inventoryReserved: true,
-            paymentReturnUrl: isPayHereOrder ? String(returnUrl).trim() : '',
-            paymentCancelUrl: isPayHereOrder ? String(cancelUrl).trim() : '',
+            paymentReturnUrl: isPayHereOrder && returnUrl ? String(returnUrl).trim() : '',
+            paymentCancelUrl: isPayHereOrder && cancelUrl ? String(cancelUrl).trim() : '',
             trackingEvents: [
                 {
                     status: initialStatus,
@@ -587,6 +792,7 @@ exports.adminUpdateOrderStatus = async (req, res) => {
 
         const order = await Order.findById(req.params.id);
         if (!order) return res.status(404).json({ message: 'Order not found' });
+        const before = order.toObject();
 
         if (!validateAdminStatusTransition(order.status, status)) {
             return res.status(400).json({
@@ -642,9 +848,111 @@ exports.adminUpdateOrderStatus = async (req, res) => {
 
         await order.save();
 
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'order',
+            resourceId: order._id,
+            resourceName: order.orderNumber,
+            before,
+            after: order,
+        });
+
         res.json({ message: 'Order status updated', order: serializeOrder(order) });
     } catch (error) {
         res.status(500).json({ message: error.message });
+    }
+};
+
+exports.adminBulkUpdateOrderStatus = async (req, res) => {
+    try {
+        const ids = Array.isArray(req.body.ids)
+            ? req.body.ids.map((id) => String(id || '').trim()).filter(Boolean)
+            : [];
+        const status = String(req.body.status || '').trim();
+
+        if (ids.length === 0) {
+            return res.status(400).json({ message: 'At least one order id is required' });
+        }
+
+        if (!VALID_ADMIN_STATUSES.includes(status)) {
+            return res.status(400).json({ message: 'Invalid status value' });
+        }
+
+        const before = [];
+        const updated = [];
+        const failed = [];
+
+        for (const id of ids) {
+            const order = await Order.findById(id);
+            if (!order) {
+                failed.push({ id, reason: 'Order not found' });
+                continue;
+            }
+
+            before.push({ _id: order._id, orderNumber: order.orderNumber, status: order.status, paymentStatus: order.paymentStatus });
+
+            if (!validateAdminStatusTransition(order.status, status)) {
+                failed.push({ id, reason: `Cannot change order status from ${order.status} to ${status}` });
+                continue;
+            }
+
+            if (status === 'processing' && order.paymentMethod === 'payhere' && order.paymentStatus !== 'paid') {
+                failed.push({ id, reason: 'Paid payment confirmation is required before processing this order' });
+                continue;
+            }
+
+            order.status = status;
+
+            if (status === 'confirmed') order.confirmedAt = new Date();
+            if (status === 'shipped' && !order.shippedAt) order.shippedAt = new Date();
+            if (status === 'delivered') {
+                order.deliveredAt = new Date();
+                if (order.paymentMethod === 'cod' && order.paymentStatus !== 'paid') {
+                    order.paymentStatus = 'paid';
+                    order.paidAt = order.paidAt || new Date();
+                }
+            }
+            if (status === 'cancelled') {
+                order.cancelledAt = new Date();
+                if (order.paymentStatus !== 'paid') {
+                    order.paymentStatus = order.paymentMethod === 'payhere' ? 'cancelled' : order.paymentStatus;
+                }
+                await restoreInventoryForOrder(order);
+            }
+            if (status === 'returned') {
+                await restoreInventoryForOrder(order);
+            }
+
+            appendTrackingEvent(order, status, `Bulk status update to ${status.replace(/_/g, ' ')}`, '');
+            await order.save();
+
+            updated.push({ _id: order._id, orderNumber: order.orderNumber, status: order.status, paymentStatus: order.paymentStatus });
+        }
+
+        await logAdminActivity({
+            req,
+            action: 'update',
+            resourceType: 'order',
+            resourceName: `Bulk order status to ${status}`,
+            before,
+            after: {
+                status,
+                updated,
+                failed,
+            },
+        });
+
+        return res.json({
+            message: `${updated.length} order${updated.length === 1 ? '' : 's'} updated`,
+            summary: {
+                requested: ids.length,
+                updated: updated.length,
+                failed,
+            },
+        });
+    } catch (error) {
+        return res.status(500).json({ message: error.message });
     }
 };
 
@@ -700,5 +1008,159 @@ exports.adminOrderStats = async (req, res) => {
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
+    }
+};
+
+exports.sellerGetOrders = async (req, res) => {
+    try {
+        const { page = 1, limit = 15, status, search } = req.query;
+        const query = {
+            items: {
+                $elemMatch: {
+                    'sellerFulfillment.seller': req.user._id,
+                },
+            },
+        };
+
+        if (status && VALID_STATUS_FILTERS.includes(String(status))) {
+            query.items.$elemMatch['sellerFulfillment.status'] = status;
+        }
+
+        if (search) {
+            query.$or = [
+                { orderNumber: { $regex: search, $options: 'i' } },
+                { 'shippingAddress.fullName': { $regex: search, $options: 'i' } },
+            ];
+        }
+
+        const total = await Order.countDocuments(query);
+        const orders = await Order.find(query)
+            .sort({ createdAt: -1 })
+            .skip((Number(page) - 1) * Number(limit))
+            .limit(Number(limit))
+            .populate('user', 'name email')
+            .populate('items.product', 'name thumbnailImage slug');
+
+        return res.json({
+            orders: orders.map((order) => getSellerOrderSlice(order, req.user._id)),
+            ...getPagingMeta(page, Number(limit), total),
+        });
+    } catch (error) {
+        return res.status(500).json({ message: error.message });
+    }
+};
+
+exports.sellerGetOrderById = async (req, res) => {
+    try {
+        const order = await Order.findOne({
+            _id: req.params.id,
+            'items.sellerFulfillment.seller': req.user._id,
+        })
+            .populate('user', 'name email')
+            .populate('items.product', 'name thumbnailImage slug');
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        return res.json({ order: getSellerOrderSlice(order, req.user._id) });
+    } catch (error) {
+        return res.status(500).json({ message: error.message });
+    }
+};
+
+exports.sellerUpdateOrderStatus = async (req, res) => {
+    try {
+        const {
+            status,
+            message,
+            location,
+            trackingNumber,
+            courier,
+            estimatedDelivery,
+        } = req.body;
+
+        if (!SELLER_EDITABLE_STATUSES.includes(String(status))) {
+            return res.status(400).json({ message: 'Invalid status value' });
+        }
+
+        const order = await Order.findOne({
+            _id: req.params.id,
+            'items.sellerFulfillment.seller': req.user._id,
+        }).populate('user', 'name email');
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        if (['processing', 'shipped', 'out_for_delivery', 'delivered'].includes(status)
+            && order.paymentMethod === 'payhere'
+            && order.paymentStatus !== 'paid') {
+            return res.status(400).json({
+                message: 'Paid payment confirmation is required before processing this PayHere order',
+            });
+        }
+
+        const sellerItems = getSellerItemsForOrder(order, req.user._id);
+        if (sellerItems.length === 0) {
+            return res.status(404).json({ message: 'No seller items found for this order' });
+        }
+
+        for (const item of sellerItems) {
+            const currentStatus = getItemFulfillmentStatus(item, order.status);
+            if (!validateAdminStatusTransition(currentStatus, status)) {
+                return res.status(400).json({
+                    message: `Cannot change item status from ${currentStatus} to ${status}`,
+                });
+            }
+        }
+
+        for (const item of sellerItems) {
+            item.sellerFulfillment.status = status;
+            item.sellerFulfillment.updatedAt = new Date();
+            if (typeof trackingNumber === 'string') item.sellerFulfillment.trackingNumber = trackingNumber.trim();
+            if (typeof courier === 'string') item.sellerFulfillment.courier = courier.trim();
+            if (estimatedDelivery) item.sellerFulfillment.estimatedDelivery = new Date(estimatedDelivery);
+
+            if (status === 'delivered') {
+                item.sellerFulfillment.payoutStatus = 'available';
+            }
+
+            if (['cancelled', 'returned'].includes(status)) {
+                await restoreInventoryForOrderItem(order, item);
+                item.sellerFulfillment.payoutStatus = 'reversed';
+            }
+        }
+
+        updateOrderReservationState(order);
+        order.status = deriveOrderStatusFromItems(order);
+
+        if (order.status === 'delivered') {
+            order.deliveredAt = order.deliveredAt || new Date();
+            if (order.paymentMethod === 'cod' && order.paymentStatus !== 'paid') {
+                order.paymentStatus = 'paid';
+                order.paidAt = order.paidAt || new Date();
+            }
+        }
+
+        if (order.status === 'cancelled') {
+            order.cancelledAt = order.cancelledAt || new Date();
+        }
+
+        appendTrackingEvent(
+            order,
+            order.status,
+            message || `${req.user?.sellerProfile?.shopName || req.user?.name || 'Seller'} updated their items to ${status.replace(/_/g, ' ')}`,
+            location || '',
+        );
+
+        await order.save();
+
+        return res.json({
+            message: 'Seller order status updated',
+            order: getSellerOrderSlice(order, req.user._id),
+        });
+    } catch (error) {
+        return res.status(500).json({ message: error.message });
     }
 };
