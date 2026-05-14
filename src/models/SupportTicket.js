@@ -124,13 +124,12 @@ const supportTicketSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-supportTicketSchema.pre('save', function (next) {
+supportTicketSchema.pre('save', function () {
     if (!this.ticketNumber) {
         const ts = Date.now().toString(36).toUpperCase();
         const rand = Math.random().toString(36).slice(2, 6).toUpperCase();
         this.ticketNumber = `SUP-${ts}-${rand}`;
     }
-    next();
 });
 
 module.exports = mongoose.model('SupportTicket', supportTicketSchema);
