@@ -27,7 +27,7 @@ function cosineSimilarity(vecA, vecB) {
         normA += left * left;
         normB += right * right;
     }
-
+ 
     if (normA <= 0 || normB <= 0) {
         return 0;
     }

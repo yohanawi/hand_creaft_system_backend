@@ -27,4 +27,4 @@ router.post("/index/:id", protect, admin, indexProduct);
 // POST /api/ai-search/index-all           — bulk index every product
 router.post("/index-all", protect, admin, indexAllProducts);
 
-module.exports = router;
+module.exports = router; 

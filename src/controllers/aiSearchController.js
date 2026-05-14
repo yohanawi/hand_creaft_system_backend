@@ -226,8 +226,11 @@ exports.indexProduct = async (req, res) => {
  */
 exports.indexAllProducts = async (req, res) => {
     try {
-        const products = await Product.find({ status: "active", isArchived: { $ne: true } }).select(
-            "+features thumbnailImage images name featuresIndexed featuresImageSignature"
+        const products = await Product.find({
+            status: "active",
+            isArchived: { $ne: true },
+        }).select(
+            "+features thumbnailImage images name status isArchived featuresIndexed featuresImageSignature"
         );
 
         const total = products.length;

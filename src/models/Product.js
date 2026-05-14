@@ -19,7 +19,7 @@ const productVariantSchema = new mongoose.Schema(
             trim: true,
         },
         style: {
-            type: String,
+            type: String, 
             default: "",
             trim: true,
         },
@@ -306,7 +306,31 @@ const productSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
+function syncArchiveState(product) {
+    const status = String(product.status || '').trim();
+    const statusWasChanged = typeof product.isModified === 'function' ? product.isModified('status') : false;
+
+    if (status === 'archived') {
+        product.isArchived = true;
+        product.archivedAt = product.archivedAt || new Date();
+        product.isFeatured = false;
+        return;
+    }
+
+    if (!statusWasChanged && typeof product.isModified === 'function' && product.isModified('isArchived') && product.isArchived === true) {
+        product.status = 'archived';
+        product.archivedAt = product.archivedAt || new Date();
+        product.isFeatured = false;
+        return;
+    }
+
+    product.isArchived = false;
+    product.archivedAt = null;
+}
+
 productSchema.pre("validate", function () {
+    syncArchiveState(this);
+
     if (Array.isArray(this.variants) && this.variants.length > 0) {
         let defaultSeen = false;
 

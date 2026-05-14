@@ -288,7 +288,7 @@ exports.getSellerProducts = async (req, res) => {
         const { search, status, page = 1, limit = 25 } = req.query;
         const query = { seller: req.user._id };
 
-        if (status && ['active', 'inactive'].includes(String(status))) {
+        if (status && ['active', 'inactive', 'archived'].includes(String(status))) {
             query.status = status;
         }
 
@@ -488,7 +488,7 @@ exports.getProducts = async (req, res) => {
             query.status = String(status);
         }
         if (adminScope) {
-            if (archived === 'only') {
+            if (archived === 'only' || query.status === 'archived') {
                 query.isArchived = true;
             } else if (archived !== 'include') {
                 query.isArchived = { $ne: true };
@@ -662,6 +662,7 @@ exports.getProductBySlug = async (req, res) => {
             _id: { $ne: product._id },
             category: product.category?._id || product.category,
             status: 'active',
+            isArchived: { $ne: true },
         })
             .sort({ isFeatured: -1, averageRating: -1, createdAt: -1 })
             .limit(4)
