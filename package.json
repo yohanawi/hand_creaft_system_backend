@@ -10,6 +10,7 @@
     "test:support": "node --test tests/supportTicket.test.js",
     "seed:handcraft-catalog": "node src/utils/seedHandcraftCatalog.js",
     "seed:auth-users": "node src/utils/seedAuthUsers.js",
+    "ai:index-catalog": "node src/utils/indexAiCatalog.js",
     "admin:bootstrap": "node src/utils/ensureAdminUser.js"
   },
   "keywords": [],

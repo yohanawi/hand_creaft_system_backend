@@ -337,6 +337,9 @@ test('searchByImage ranks fresh products, applies tie-breakers, and caps results
 
             assert.equal(res.statusCode, 200);
             assert.equal(res.body.total, 12);
+            assert.equal(res.body.products.length, 12);
+            assert.equal(res.body.products[0].name, 'Featured Ring');
+            assert.equal(res.body.searchStrategy.mode, 'prediction-first');
             assert.deepEqual(
                 res.body.results.slice(0, 3).map((entry) => entry.product.sku),
                 ['FEATURED-TOP', 'INSTOCK-SECOND', 'OUT-OF-STOCK-THIRD'],

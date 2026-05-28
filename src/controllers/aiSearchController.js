@@ -1,16 +1,6 @@
-/**
- * AI Image Search Controller
- *
- * Provides two public-facing capabilities:
- *  1. searchByImage  — user uploads a photo → get visually similar products
- *  2. getIndexStatus — how many products have been AI-indexed (admin info)
- *
- * And two admin-only utilities:
- *  3. indexProduct      — extract + store features for ONE product
- *  4. indexAllProducts  — bulk-index every product that has an image
- */
-
 const fs = require("fs");
+
+const Category = require("../models/Category");
 const Product = require("../models/Product");
 const {
     AI_SERVICE_URL,
@@ -25,10 +15,9 @@ const {
     indexProductDocument,
     isProductAiEligible,
     markProductAiIndexStale,
+    predictImageFromFile,
     serializeAiProduct,
 } = require("../utils/aiSearch");
-
-// ─── Config ──────────────────────────────────────────────────────────────────
 
 function buildVisualMatches(products, queryFeatures) {
     const sorted = products
@@ -55,25 +44,142 @@ function buildVisualMatches(products, queryFeatures) {
     return sorted.slice(0, 12);
 }
 
-// ─── Controllers ──────────────────────────────────────────────────────────────
+function escapeRegex(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-/**
- * POST /api/ai-search/search
- * Body: multipart/form-data  { image: <file> }
- *
- * Returns top-N visually similar products sorted by cosine similarity.
- */
+function normalizePredictionCategory(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    const singular = {
+        rings: 'ring',
+        bracelets: 'bracelet',
+        necklaces: 'necklace',
+        earrings: 'earring',
+        pendants: 'pendant',
+        bangles: 'bangle',
+    };
+
+    return singular[normalized] || normalized;
+}
+
+function getCategoryName(category) {
+    if (!category) {
+        return '';
+    }
+
+    if (typeof category === 'string') {
+        return category;
+    }
+
+    return category.name || '';
+}
+
+function getPrimaryImage(product) {
+    return product.thumbnailImage || product.images?.[0] || '';
+}
+
+function buildProfessionalMatch(entry) {
+    const product = entry.product;
+    return {
+        product_id: product._id,
+        name: product.name,
+        category: getCategoryName(product.category),
+        similarity: Number(entry.score.toFixed(4)),
+        image: getPrimaryImage(product),
+        price: typeof product.salePrice === 'number' && product.salePrice < product.price
+            ? product.salePrice
+            : product.price,
+    };
+}
+
+function buildProductSummary(entry) {
+    const product = entry.product;
+    return {
+        _id: product._id,
+        name: product.name,
+        slug: product.slug,
+        category: getCategoryName(product.category),
+        image: getPrimaryImage(product),
+        price: typeof product.salePrice === 'number' && product.salePrice < product.price
+            ? product.salePrice
+            : product.price,
+        currency: product.currency || 'USD',
+        similarity: Number(entry.score.toFixed(4)),
+        availabilityStatus: product.availabilityStatus,
+        quantity: Number(product.quantity || 0),
+    };
+}
+
+async function findCategoryIdsForPrediction(category) {
+    const normalized = normalizePredictionCategory(category);
+    if (!normalized) {
+        return [];
+    }
+
+    const plural = normalized.endsWith('s') ? normalized : `${normalized}s`;
+    const categoryRegex = new RegExp(`^(${escapeRegex(normalized)}|${escapeRegex(plural)})$`, 'i');
+    const categories = await Category.find({ name: categoryRegex }).select('_id').lean();
+    return categories.map((item) => item._id);
+}
+
+function buildProductQuery(categoryIds = []) {
+    const query = {
+        status: 'active',
+        isArchived: { $ne: true },
+        featuresIndexed: true,
+    };
+
+    if (categoryIds.length > 0) {
+        query.category = { $in: categoryIds };
+    }
+
+    return query;
+}
+
+function getIndexedProducts(query) {
+    return Product.find(query)
+        .select('+features name slug description price salePrice currency thumbnailImage images category subcategory material color availabilityStatus quantity isFeatured sku tags averageRating reviewCount featuresIndexed featuresImageSignature')
+        .populate("category", "name")
+        .populate("subcategory", "name")
+        .lean();
+}
+
+async function analyzeUploadedImage(filePath) {
+    if (typeof predictImageFromFile === 'function') {
+        return predictImageFromFile(filePath);
+    }
+
+    const features = await extractProductFeatures(filePath);
+    return {
+        prediction: null,
+        features,
+        featureMeta: {
+            feature_size: features.length,
+            normalized: true,
+            model: 'MobileNetV2',
+        },
+    };
+}
+
 exports.searchByImage = async (req, res) => {
     try {
-        // ── 1. Validate upload ────────────────────────────────────────────────
         if (!req.file) {
             return res.status(400).json({ message: "Please upload an image file." });
         }
 
-        // ── 2. Ask AI service for query-image features ─────────────────────
         let queryFeatures;
+        let prediction = null;
+        let featureMeta = null;
+
         try {
-            queryFeatures = await extractProductFeatures(req.file.path);
+            const aiAnalysis = await analyzeUploadedImage(req.file.path);
+            queryFeatures = aiAnalysis.features;
+            prediction = aiAnalysis.prediction || null;
+            featureMeta = aiAnalysis.featureMeta || {
+                feature_size: queryFeatures.length,
+                normalized: true,
+                model: 'MobileNetV2',
+            };
         } catch (aiError) {
             const failure = buildAiServiceFailurePayload(
                 aiError,
@@ -103,43 +209,74 @@ exports.searchByImage = async (req, res) => {
                 catalog,
             });
         } finally {
-            // Remove the temp upload regardless of outcome
             if (req.file && req.file.path) {
                 fs.unlink(req.file.path, () => { });
             }
         }
 
-        // ── 3. Load all indexed products (features included via +features) ──
-        const products = await Product.find({
-            status: 'active',
-            isArchived: { $ne: true },
-            featuresIndexed: true,
-        })
-            .select('+features name slug description price salePrice currency thumbnailImage images category subcategory material color availabilityStatus quantity isFeatured sku tags averageRating reviewCount featuresIndexed featuresImageSignature')
-            .populate("category", "name")
-            .populate("subcategory", "name")
-            .lean();
+        const categoryIds = prediction?.category
+            ? await findCategoryIdsForPrediction(prediction.category)
+            : [];
+        const categoryFiltered = categoryIds.length > 0;
+        let usedGlobalFallback = false;
 
-        const freshProducts = products.filter(hasFreshAiFeatures);
+        let products = await getIndexedProducts(buildProductQuery(categoryIds));
+        let freshProducts = products.filter(hasFreshAiFeatures);
+
+        if (categoryFiltered && freshProducts.length === 0) {
+            usedGlobalFallback = true;
+            products = await getIndexedProducts(buildProductQuery());
+            freshProducts = products.filter(hasFreshAiFeatures);
+        }
+
+        const features = {
+            feature_size: featureMeta?.feature_size || queryFeatures.length,
+            normalized: featureMeta?.normalized !== false,
+            model: featureMeta?.model,
+        };
 
         if (freshProducts.length === 0) {
             const catalog = await getAiCatalogStats();
             return res.json({
-                message:
-                    "No products are AI-indexed yet. Ask an admin to run the indexing step.",
+                success: true,
+                message: "No products are AI-indexed yet. Ask an admin to run the indexing step.",
+                prediction,
+                features,
+                products: [],
+                matches: [],
                 catalog,
                 results: [],
                 total: 0,
+                searchStrategy: {
+                    mode: 'prediction-first',
+                    categoryFiltered,
+                    fallbackToGlobal: usedGlobalFallback,
+                },
             });
         }
 
-        // ── 4. Score every product ────────────────────────────────────────
         const scored = buildVisualMatches(freshProducts, queryFeatures);
+        const simplifiedProducts = scored.map(buildProductSummary);
 
         res.json({
+            success: true,
             message: `Found ${scored.length} similar product(s).`,
+            prediction,
+            features,
+            products: simplifiedProducts,
+            matches: scored.map(buildProfessionalMatch),
             results: scored,
             total: scored.length,
+            categoryFilter: {
+                predicted: prediction?.category || null,
+                applied: categoryFiltered,
+                matchedCategoryCount: categoryIds.length,
+            },
+            searchStrategy: {
+                mode: 'prediction-first',
+                categoryFiltered,
+                fallbackToGlobal: usedGlobalFallback,
+            },
         });
     } catch (error) {
         console.error("searchByImage error:", error);
@@ -183,10 +320,6 @@ exports.getAiHealth = async (req, res) => {
     }
 };
 
-/**
- * POST /api/ai-search/index/:id  (admin)
- * Extract and save AI features for a single product.
- */
 exports.indexProduct = async (req, res) => {
     try {
         const product = await Product.findById(req.params.id).select("+features");
@@ -219,11 +352,6 @@ exports.indexProduct = async (req, res) => {
     }
 };
 
-/**
- * POST /api/ai-search/index-all  (admin)
- * Background-style: streams JSON progress back to the client.
- * Indexes every active product that has an image.
- */
 exports.indexAllProducts = async (req, res) => {
     try {
         const products = await Product.find({
@@ -270,7 +398,7 @@ exports.indexAllProducts = async (req, res) => {
             indexed,
             skipped,
             failed,
-            errors: errors.slice(0, 20), // cap error list
+            errors: errors.slice(0, 20),
         });
     } catch (error) {
         console.error("indexAllProducts error:", error);
@@ -278,10 +406,6 @@ exports.indexAllProducts = async (req, res) => {
     }
 };
 
-/**
- * GET /api/ai-search/index-status  (admin)
- * Returns how many products are indexed vs total.
- */
 exports.getIndexStatus = async (req, res) => {
     try {
         const [catalog, pendingCandidates, aiHealth] = await Promise.all([

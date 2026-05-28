@@ -117,6 +117,37 @@ async function extractFeaturesFromFile(filePath) {
     return response.data.features;
 }
 
+async function predictImageFromFile(filePath) {
+    const form = new FormData();
+    form.append('image', fs.createReadStream(filePath));
+
+    const response = await axios.post(`${AI_SERVICE_URL}/predict`, form, {
+        headers: form.getHeaders(),
+        timeout: 60000,
+    });
+
+    const featureVector = Array.isArray(response.data?.features?.vector)
+        ? response.data.features.vector
+        : Array.isArray(response.data?.features)
+            ? response.data.features
+            : [];
+
+    if (!featureVector.length) {
+        throw new Error('AI service returned no feature vector');
+    }
+
+    return {
+        prediction: response.data?.prediction || null,
+        features: featureVector,
+        featureMeta: {
+            feature_size: Number(response.data?.features?.feature_size || featureVector.length),
+            normalized: response.data?.features?.normalized !== false,
+            model: response.data?.features?.model,
+        },
+        raw: response.data,
+    };
+}
+
 async function extractFeaturesFromUrl(imageUrl) {
     const response = await axios.post(
         `${AI_SERVICE_URL}/extract-url`,
@@ -361,6 +392,7 @@ module.exports = {
     clearProductAiIndex,
     cosineSimilarity,
     extractProductFeatures,
+    predictImageFromFile,
     getAiCatalogStats,
     getAiServiceHealth,
     getProductImageSignature,
